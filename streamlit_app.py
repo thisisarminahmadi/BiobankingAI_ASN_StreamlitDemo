@@ -88,7 +88,7 @@ data = load_data()
 data_tab, viz_tab, summary_tab = st.tabs(["Data Table", "Visualizations", "Summary Stats"])
 
 with data_tab:
-    st.write("### ASN Table from Snowflake")
+    st.write("### PilotData-WholeGlobe_Banked+Pending")
     
     # Global search across all columns
     search_query = st.text_input("Global Search (case-insensitive, searches all columns)", "")
