@@ -1,7 +1,5 @@
 # Import packages
 import streamlit as st
-st.write("Secrets loaded keys:", list(st.secrets.keys()))
-st.write("st.secrets['connections']:", st.secrets.get("connections"))
 import pandas as pd
 import altair as alt
 import datetime
