@@ -32,7 +32,9 @@ if not check_password():
     st.stop()  # Halt execution until correct password is entered
 
 # App title
-st.title("📊 ASN Cleaned")
+st.title("🧬 BiobankTidy") 
+st.caption("BiobankingAI – MVP in collaboration with ASN")
+
 
 # Snowflake connection (using secrets.toml)
 try:
