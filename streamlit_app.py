@@ -167,13 +167,17 @@ with data_tab:
             -moz-user-select: none;
             -ms-user-select: none;
         }
-        [data-testid="stDownloadButton"] {
+    
+        [data-testid="stDownloadButton"],
+        .stDataFrame .st-eb,
+        .stDataFrame [data-testid="stElementToolbar"] {
             display: none !important;
         }
         </style>
         """,
         unsafe_allow_html=True
     )
+
 
 with viz_tab:
     st.write("### Data Visualizations (based on filtered data)")
