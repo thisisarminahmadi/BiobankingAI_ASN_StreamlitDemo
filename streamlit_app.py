@@ -1,10 +1,8 @@
 # Import packages
 import streamlit as st
-from snowflake.snowpark.context import get_active_session
 import pandas as pd
 import altair as alt
 import datetime
-import streamlit_authenticator as stauth
 from snowflake.connector import connect
 import os
 
@@ -13,7 +11,7 @@ def check_password():
     """Returns True if the user entered the correct password."""
     def password_entered():
         """Checks whether the entered password is correct."""
-        if st.session_state["password"] == st.secrets.get("APP_PASSWORD", "your_secure_password"):
+        if st.session_state["password"] == st.secrets.get("APP_PASSWORD", "dxt(Kl='1]87"):
             st.session_state["password_correct"] = True
         else:
             st.session_state["password_correct"] = False
@@ -36,25 +34,35 @@ if not check_password():
 # App title
 st.title("📊 ASN Cleaned")
 
-# Snowflake connection (using environment variables or secrets for security)
+# Snowflake connection (using secrets.toml)
 try:
-    # For Streamlit Community Cloud, use secrets.toml or environment variables
     conn = connect(
-        account=st.secrets.get("SNOWFLAKE_ACCOUNT", os.getenv("SNOWFLAKE_ACCOUNT")),
-        user=st.secrets.get("SNOWFLAKE_USER", os.getenv("SNOWFLAKE_USER")),
-        password=st.secrets.get("SNOWFLAKE_PASSWORD", os.getenv("SNOWFLAKE_PASSWORD")),
-        database=st.secrets.get("SNOWFLAKE_DATABASE", os.getenv("SNOWFLAKE_DATABASE")),
-        schema=st.secrets.get("SNOWFLAKE_SCHEMA", os.getenv("SNOWFLAKE_SCHEMA")),
-        warehouse=st.secrets.get("SNOWFLAKE_WAREHOUSE", os.getenv("SNOWFLAKE_WAREHOUSE")),
-        role=st.secrets.get("SNOWFLAKE_ROLE", os.getenv("SNOWFLAKE_ROLE"))
+        account=st.secrets["connections.snowflake"]["account"],
+        user=st.secrets["connections.snowflake"]["user"],
+        password=st.secrets["connections.snowflake"]["password"],
+        database=st.secrets["connections.snowflake"]["database"],
+        schema=st.secrets["connections.snowflake"]["schema"],
+        warehouse=st.secrets["connections.snowflake"]["warehouse"],
+        role=st.secrets["connections.snowflake"]["role"]
     )
-    session = get_active_session()  # Fallback to Snowflake session if running in Snowflake
-except:
-    session = get_active_session()  # Use Snowflake session if external connection fails
+except Exception as e:
+    st.error(f"Failed to connect to Snowflake: {str(e)}")
+    st.stop()
 
 # Load your Snowflake table
-df = session.table("ASN")
-df_pandas = df.to_pandas()
+try:
+    cursor = conn.cursor()
+    query = "SELECT * FROM ASN"
+    cursor.execute(query)
+    df_pandas = pd.DataFrame.from_records(iter(cursor), columns=[x[0] for x in cursor.description])
+    cursor.close()
+except Exception as e:
+    st.error(f"Error querying Snowflake: {str(e)}")
+    conn.close()
+    st.stop()
+
+# Close the connection
+conn.close()
 
 # Cache the data to improve performance
 @st.cache_data
