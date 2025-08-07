@@ -39,13 +39,13 @@ st.title("📊 ASN Cleaned")
 # Snowflake connection (using secrets.toml)
 try:
     conn = connect(
-        account=st.secrets["connections.snowflake"]["account"],
-        user=st.secrets["connections.snowflake"]["user"],
-        password=st.secrets["connections.snowflake"]["password"],
-        database=st.secrets["connections.snowflake"]["database"],
-        schema=st.secrets["connections.snowflake"]["schema"],
-        warehouse=st.secrets["connections.snowflake"]["warehouse"],
-        role=st.secrets["connections.snowflake"]["role"]
+        account=st.secrets["connections"]["snowflake"]["account"],
+        user=st.secrets["connections"]["snowflake"]["user"],
+        password=st.secrets["connections"]["snowflake"]["password"],
+        database=st.secrets["connections"]["snowflake"]["database"],
+        schema=st.secrets["connections"]["snowflake"]["schema"],
+        warehouse=st.secrets["connections"]["snowflake"]["warehouse"],
+        role=st.secrets["connections"]["snowflake"]["role"]
     )
 except Exception as e:
     st.error(f"Failed to connect to Snowflake: {str(e)}")
