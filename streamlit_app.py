@@ -430,11 +430,11 @@ class SnowflakeCortexSearchEngine:
             return True  # Other errors might not be related to Cortex availability
 
 # Initialize Snowflake Cortex search engine
-@st.cache_resource
 def get_cortex_search_engine(connection) -> SnowflakeCortexSearchEngine:
     return SnowflakeCortexSearchEngine(connection)
 
-cortex_search_engine = get_cortex_search_engine(conn)
+# Initialize search engine without caching to avoid UnhashableParamError
+cortex_search_engine = SnowflakeCortexSearchEngine(conn)
 
 # Test Cortex availability
 cortex_available = cortex_search_engine.test_cortex_availability()
@@ -451,23 +451,24 @@ except Exception as e:
     conn.close()
     st.stop()
 
-# Cache the data to improve performance
-@st.cache_data
-def load_data():
+# Process the data
+def process_data(df: pd.DataFrame) -> pd.DataFrame:
+    """Process the dataframe for better compatibility."""
     # Convert date/time columns to datetime if possible
-    date_cols = [col for col in df_pandas.columns if 'Date' in col or 'Time' in col]
+    date_cols = [col for col in df.columns if 'Date' in col or 'Time' in col]
     for col in date_cols:
         try:
-            df_pandas[col] = pd.to_datetime(df_pandas[col], errors='coerce')
+            df[col] = pd.to_datetime(df[col], errors='coerce')
         except:
             pass
     # Ensure GENDER and other categorical columns are strings
     for col in ['GENDER', 'Patient Race', 'OD_OS']:
-        if col in df_pandas.columns:
-            df_pandas[col] = df_pandas[col].astype(str).replace('nan', None)
-    return df_pandas
+        if col in df.columns:
+            df[col] = df[col].astype(str).replace('nan', None)
+    return df
 
-data = load_data()
+# Process the data directly
+data = process_data(df_pandas)
 
 # Column categorization function
 def categorize_columns(columns: List[str]) -> Dict[str, List[str]]:
