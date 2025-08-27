@@ -110,13 +110,14 @@ class SnowflakeCortexSearchEngine:
         # Clean the query to avoid SQL injection and syntax errors
         clean_query = user_query.replace("'", "''").replace('"', '""')
         
-        # Use a simple Cortex search query
+        # Use proper Cortex search syntax
         cortex_query = f"""
         SELECT *,
                CORTEX_SEARCH('{clean_query}') as search_score
         FROM ASN 
         WHERE CORTEX_SEARCH('{clean_query}') > 0.1
         ORDER BY search_score DESC
+        LIMIT 1000
         """
         
         return cortex_query
@@ -169,6 +170,7 @@ class SnowflakeCortexSearchEngine:
         WHERE {where_clause}
         AND CORTEX_SEARCH('{clean_query}') > 0.05
         ORDER BY search_score DESC
+        LIMIT 1000
         """
         
         return hybrid_query
@@ -193,10 +195,26 @@ class SnowflakeCortexSearchEngine:
                 sql_query = self._generate_hybrid_search_query(query)
             else:
                 # Fallback to basic search
-                sql_query = f"""
-                SELECT * FROM ASN 
-                WHERE LOWER(CAST(OBJECT_CONSTRUCT(*) AS STRING)) LIKE '%{query.lower()}%'
-                """
+                # Search across common columns instead of using OBJECT_CONSTRUCT
+                search_columns = ['GENDER', 'Patient Race', 'OD_OS', 'Hx_Diabetes', 'Hx_Hypertension', 'Hx_Heart_Disease', 'Sx_Vision']
+                search_conditions = []
+                for col in search_columns:
+                    if col in df.columns:
+                        search_conditions.append(f"LOWER(CAST({col} AS STRING)) LIKE '%{query.lower()}%'")
+                
+                if search_conditions:
+                    sql_query = f"""
+                    SELECT * FROM ASN 
+                    WHERE {' OR '.join(search_conditions)}
+                    """
+                else:
+                    # If no specific columns found, search in first few columns
+                    available_cols = list(df.columns)[:10]  # First 10 columns
+                    search_conditions = [f"LOWER(CAST({col} AS STRING)) LIKE '%{query.lower()}%'" for col in available_cols]
+                    sql_query = f"""
+                    SELECT * FROM ASN 
+                    WHERE {' OR '.join(search_conditions)}
+                    """
             
             # Execute the query
             self.cursor.execute(sql_query)
@@ -217,11 +235,29 @@ class SnowflakeCortexSearchEngine:
             st.error(f"Snowflake Cortex search failed: {str(e)}")
             # Fallback to basic search
             try:
-                # Use a simpler fallback search
-                self.cursor.execute(f"""
-                SELECT * FROM ASN 
-                WHERE LOWER(CAST(OBJECT_CONSTRUCT(*) AS STRING)) LIKE '%{query.lower()}%'
-                """)
+                # Use a simpler fallback search without OBJECT_CONSTRUCT
+                search_columns = ['GENDER', 'Patient Race', 'OD_OS', 'Hx_Diabetes', 'Hx_Hypertension', 'Hx_Heart_Disease', 'Sx_Vision']
+                search_conditions = []
+                for col in search_columns:
+                    search_conditions.append(f"LOWER(CAST({col} AS STRING)) LIKE '%{query.lower()}%'")
+                
+                if search_conditions:
+                    fallback_query = f"""
+                    SELECT * FROM ASN 
+                    WHERE {' OR '.join(search_conditions)}
+                    LIMIT 1000
+                    """
+                else:
+                    # If no specific columns found, search in first few columns
+                    available_cols = list(self.cursor.execute("SELECT * FROM ASN LIMIT 1").fetchone())[:10]
+                    search_conditions = [f"LOWER(CAST({col} AS STRING)) LIKE '%{query.lower()}%'" for col in available_cols]
+                    fallback_query = f"""
+                    SELECT * FROM ASN 
+                    WHERE {' OR '.join(search_conditions)}
+                    LIMIT 1000
+                    """
+                
+                self.cursor.execute(fallback_query)
                 df = pd.DataFrame.from_records(iter(self.cursor), columns=[x[0] for x in self.cursor.description])
                 return df, {"interpretation": f"Fallback search for: {query}", "error": str(e)}
             except Exception as fallback_error:
@@ -253,15 +289,16 @@ class SnowflakeCortexSearchEngine:
         
         return list(set(suggestions))[:10]
     
-    def test_cortex_availability(self) -> bool:
-        """Test if Snowflake Cortex is available."""
+    def check_cortex_availability(self) -> bool:
+        """Check if Snowflake Cortex AI is available."""
         try:
-            self.cursor.execute("SELECT CORTEX_SEARCH('test', columns => ARRAY_CONSTRUCT('GENDER')) FROM ASN LIMIT 1")
+            # Test if CORTEX_SEARCH function is available
+            test_query = "SELECT CORTEX_SEARCH('test') FROM ASN LIMIT 1"
+            self.cursor.execute(test_query)
             return True
         except Exception as e:
-            if "CORTEX_SEARCH" in str(e).upper():
-                return False
-            return True  # Other errors might not be related to Cortex availability
+            # If Cortex is not available, we'll get an error
+            return False
 
 # Initialize Snowflake Cortex search engine
 def get_cortex_search_engine(connection) -> SnowflakeCortexSearchEngine:
@@ -271,7 +308,7 @@ def get_cortex_search_engine(connection) -> SnowflakeCortexSearchEngine:
 cortex_search_engine = SnowflakeCortexSearchEngine(conn)
 
 # Test Cortex availability
-cortex_available = cortex_search_engine.test_cortex_availability()
+cortex_available = cortex_search_engine.check_cortex_availability()
 
 # Load initial data
 try:
