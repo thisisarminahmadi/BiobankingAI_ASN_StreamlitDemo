@@ -106,6 +106,24 @@ def col_distinct(col: str, limit: int = 2000):
     cur.close()
     # convert to str for robust matching in 'IN'
     return sorted(map(str, vals))
+
+@st.cache_data(show_spinner=False)
+def col_profile(col: str):
+    kind = META.loc[META['column']==col, 'kind'].iloc[0]
+    if kind == 'number':
+        lo, hi = col_minmax(col)
+        return {'kind':'number', 'min': lo, 'max': hi}
+    if kind == 'datetime':
+        lo, hi = col_minmax(col)
+        lo = pd.to_datetime(lo) if lo is not None else None
+        hi = pd.to_datetime(hi) if hi is not None else None
+        return {'kind':'datetime','min': lo, 'max': hi}
+    # text
+    vals = col_distinct(col, limit=2000)
+    lower = {v.strip().lower() for v in vals}
+    is_bool = lower.issubset({'0','1','yes','no','true','false'}) and len(lower) <= 4
+    samples = vals[:20]
+    return {'kind':'text','n_distinct': len(vals), 'samples': samples, 'is_bool': is_bool}
 # ----------------------------------------
 
 # ------------- query builder ------------
@@ -134,7 +152,10 @@ def build_where(clauses: List[Clause]) -> Tuple[str, List[Any]]:
     if not clauses:
         return "", []
     parts, params = [], []
+    valid_seen = False
     for i, c in enumerate(clauses):
+        if not c.column or not c.op:
+            continue
         col = quote_ident(c.column)
         if c.op == 'in':
             vals = c.value if isinstance(c.value, list) else [c.value]
@@ -155,19 +176,20 @@ def build_where(clauses: List[Clause]) -> Tuple[str, List[Any]]:
             sql = OP_SQL[c.op].format(col=col)
             p = [c.value]
 
-        if i > 0:
+        if valid_seen:
             parts.append(c.join)
         parts.append(f"({sql})")
         params.extend(p)
-
-    return "WHERE " + " ".join(parts), params
+        valid_seen = True
+    return ("WHERE " + " ".join(parts)) if valid_seen else "", params
 
 def fetch_data(clauses: List[Clause], columns: List[str] | None = None, limit: int = 5000):
     where, params = build_where(clauses)
     cols_sql = ", ".join(quote_ident(c) for c in columns) if columns else "*"
-    sql = f"SELECT {cols_sql} FROM {quote_ident(TABLE)} {where} LIMIT %s"
+    # ❗ interpolate LIMIT directly (no bound param)
+    sql = f"SELECT {cols_sql} FROM {quote_ident(TABLE)} {where} LIMIT {int(limit)}"
     cur = conn.cursor()
-    cur.execute(sql, params + [limit])
+    cur.execute(sql, params)  # only data params are bound
     df = pd.DataFrame.from_records(iter(cur), columns=[c[0] for c in cur.description])
     cur.close()
     return df
@@ -218,22 +240,52 @@ with data_tab:
                                        key=f"join_{i}", horizontal=True)
 
                 # searchable column picker
-                q = st.text_input("Find a column", key=f"q_{i}", placeholder="type to search…")
+                q = st.text_input("Find a column", key=f"q_{i}", placeholder="type 2–3 letters…")
                 subset = META if not q else META[META['column'].str.contains(q, case=False, na=False)]
-                cl.column = st.selectbox("Column", options=subset['column'].tolist(),
-                                         index=(subset['column'].tolist().index(cl.column)
-                                                if cl.column in subset['column'].tolist() else 0) if len(subset)>0 else None,
-                                         key=f"col_{i}")
+                # Show live suggestions (first 20) to feel "predictive"
+                if q:
+                    st.caption("Suggestions: " + ", ".join(subset['column'].head(20).tolist()) if len(subset) else "No matches")
+
+                if subset.empty:
+                    st.warning("No columns match your search.")
+                    continue  # don't render operator/value for this filter
+
+                cl.column = st.selectbox(
+                    "Column",
+                    options=subset['column'].tolist(),
+                    index=0 if cl.column not in subset['column'].tolist() else subset['column'].tolist().index(cl.column),
+                    key=f"col_{i}"
+                )
 
                 if not cl.column:
                     continue
 
-                kind = META.loc[META['column']==cl.column, 'kind'].iloc[0]
+                profile = col_profile(cl.column)
+                if profile['kind'] == 'number':
+                    st.caption(f"Range: **{profile['min']} – {profile['max']}**")
+                elif profile['kind'] == 'datetime':
+                    lo = profile['min'].date() if profile['min'] is not None else '—'
+                    hi = profile['max'].date() if profile['max'] is not None else '—'
+                    st.caption(f"Date range: **{lo} – {hi}**")
+                else:
+                    if profile.get('is_bool'):
+                        st.caption("Values: **Yes/No / True/False / 0/1**")
+                    else:
+                        st.caption(f"Distinct values: **{profile['n_distinct']}**; samples: {', '.join(map(str, profile['samples']))}")
 
                 # operator + value widgets
-                if kind == 'number':
+                if profile['kind'] == 'number':
                     ops = ['between','=', '!=', '>', '>=', '<', '<=', 'isnull', 'notnull']
-                    cl.op = st.selectbox("Operator", ops, index=ops.index(cl.op) if cl.op in ops else 0, key=f"op_n_{i}")
+                elif profile['kind'] == 'datetime':
+                    ops = ['between','=', '>=', '<=', 'isnull', 'notnull']
+                else:
+                    if profile.get('is_bool'):
+                        ops = ['=','!=','isnull','notnull']
+                    else:
+                        ops = ['contains','=', '!=', 'in','isnull','notnull']
+                cl.op = st.selectbox("Operator", ops, index=ops.index(cl.op) if cl.op in ops else 0, key=f"op_{i}")
+
+                if profile['kind'] == 'number':
                     if cl.op == 'between':
                         lo, hi = col_minmax(cl.column)
                         lo = float(lo or 0.0); hi = float(hi or 0.0 if lo==0 else hi)
@@ -241,9 +293,7 @@ with data_tab:
                     elif cl.op not in ('isnull','notnull'):
                         cl.value = st.number_input("Value", value=float(cl.value or 0.0), key=f"val_n_{i}")
 
-                elif kind == 'datetime':
-                    ops = ['between','=', '>=', '<=', 'isnull', 'notnull']
-                    cl.op = st.selectbox("Operator", ops, index=ops.index(cl.op) if cl.op in ops else 0, key=f"op_d_{i}")
+                elif profile['kind'] == 'datetime':
                     if cl.op == 'between':
                         lo, hi = col_minmax(cl.column)
                         lo = pd.to_datetime(lo) if lo is not None else pd.Timestamp("1900-01-01")
@@ -255,9 +305,9 @@ with data_tab:
                         cl.value = pd.to_datetime(d)
 
                 else:  # text
-                    ops = ['contains','=', '!=', 'in', 'isnull', 'notnull']
-                    cl.op = st.selectbox("Operator", ops, index=ops.index(cl.op) if cl.op in ops else 0, key=f"op_t_{i}")
-                    if cl.op == 'in':
+                    if profile['kind']=='text' and profile.get('is_bool') and cl.op in ('=','!='):
+                        cl.value = st.radio("Value", ['Yes','No'], horizontal=True, key=f"bool_{i}")
+                    elif cl.op == 'in':
                         options = col_distinct(cl.column)
                         sel = st.multiselect("Values", options=options, default=cl.value or [], key=f"in_{i}")
                         cl.value = sel
@@ -287,75 +337,82 @@ with data_tab:
 # -------------- end data tab -----------
 
 with viz_tab:
-    st.write("### Data Visualizations (based on filtered data)")
-    
-    # Get numeric, categorical, and flag columns
-    numeric_cols = filtered_df.select_dtypes(include=['number']).columns.tolist()
-    all_cols = filtered_df.columns.tolist()
-    flag_cols = [col for col in all_cols if col.startswith(('Hx_', 'Sx_', 'Med_'))]
-    categorical_cols = ['GENDER', 'Patient Race', 'OD_OS'] + flag_cols
-    
-    # Histogram for numeric columns
-    if numeric_cols:
-        hist_col = st.selectbox("Histogram: Select numeric column (e.g., Age)", sorted(numeric_cols))
-        if hist_col and not filtered_df[hist_col].isna().all():
-            hist_chart = alt.Chart(filtered_df).mark_bar().encode(
-                alt.X(hist_col, bin=True),
-                y='count()',
-                tooltip=['count()']
-            ).properties(title=f"Histogram of {hist_col}").interactive()
-            st.altair_chart(hist_chart, use_container_width=True)
-        else:
-            st.warning(f"No valid data for {hist_col} to display histogram.")
-    
-    # Bar chart for categorical/binary columns
-    cat_col = st.selectbox("Bar Chart: Select categorical/flag column", sorted(categorical_cols))
-    if cat_col in filtered_df.columns and not filtered_df[cat_col].isna().all():
-        bar_chart = alt.Chart(filtered_df).mark_bar().encode(
-            x=alt.X(cat_col, type='nominal'),
-            y='count()',
-            color=cat_col,
-            tooltip=['count()', cat_col]
-        ).properties(title=f"Distribution of {cat_col}").interactive()
-        try:
-            st.altair_chart(bar_chart, use_container_width=True)
-        except Exception as e:
-            st.warning(f"Unable to render bar chart for {cat_col}: {str(e)}")
+    st.subheader("Explore (based on current filters)")
+
+    if filtered_df.empty:
+        st.info("No data to visualize. Adjust filters.")
     else:
-        st.warning(f"Column {cat_col} not found or has no valid data for bar chart.")
-    
-    # Scatter plot for numeric columns
-    if len(numeric_cols) >= 2:
-        scatter_x = st.selectbox("Scatter: X-axis (numeric)", sorted(numeric_cols))
-        scatter_y = st.selectbox("Scatter: Y-axis (numeric)", sorted(numeric_cols))
-        if scatter_x in filtered_df.columns and scatter_y in filtered_df.columns and not filtered_df[[scatter_x, scatter_y]].isna().all().all():
-            scatter_chart = alt.Chart(filtered_df).mark_circle().encode(
-                x=scatter_x,
-                y=scatter_y,
-                tooltip=[scatter_x, scatter_y]
-            ).properties(title=f"{scatter_x} vs {scatter_y}").interactive()
-            st.altair_chart(scatter_chart, use_container_width=True)
-        else:
-            st.warning(f"No valid data for {scatter_x} or {scatter_y} to display scatter plot.")
-    
-    # Pie chart for specific categorical columns
-    pie_col = st.selectbox("Pie Chart: Select column (e.g., GENDER)", sorted(['GENDER', 'OD_OS', 'Patient Race']))
-    if pie_col in filtered_df.columns and not filtered_df[pie_col].isna().all():
-        pie_data = filtered_df[[pie_col]].dropna()  # Drop nulls for pie chart
-        if not pie_data.empty:
-            pie_chart = alt.Chart(pie_data).mark_arc().encode(
-                theta=alt.Theta("count()", stack=True),
-                color=alt.Color(pie_col, type='nominal'),
-                tooltip=[pie_col, 'count()']
-            ).properties(title=f"Pie Chart of {pie_col}")
-            try:
-                st.altair_chart(pie_chart, use_container_width=True)
-            except Exception as e:
-                st.warning(f"Unable to render pie chart for {pie_col}: {str(e)}")
-        else:
-            st.warning(f"No valid data for {pie_col} to display pie chart.")
-    else:
-        st.warning(f"Column {pie_col} not found or has no valid data for pie chart.")
+        cols = filtered_df.columns.tolist()
+        num_cols = [c for c in cols if pd.api.types.is_numeric_dtype(filtered_df[c])]
+        cat_cols = [c for c in cols if filtered_df[c].nunique(dropna=True) <= 50]
+
+        chart_type = st.selectbox(
+            "Chart type",
+            ["Bar (count by category)", "Histogram", "Scatter", "Heatmap (count)"]
+        )
+
+        if chart_type == "Bar (count by category)":
+            if not cat_cols:
+                st.warning("No categorical columns (≤50 distinct) in the current data.")
+            else:
+                cat = st.selectbox("Category", cat_cols)
+                topk = st.slider("Top K", 5, 100, 20)
+                vc = (filtered_df[cat].astype(str)
+                      .value_counts(dropna=True)
+                      .head(topk)
+                      .reset_index())
+                vc.columns = [cat, 'count']
+                bar = alt.Chart(vc).mark_bar().encode(
+                    x=alt.X(cat, sort='-y'),
+                    y='count',
+                    tooltip=[cat, 'count']
+                ).properties(title=f"Count of {cat} (Top {topk})").interactive()
+                st.altair_chart(bar, use_container_width=True)
+
+        elif chart_type == "Histogram":
+            if not num_cols:
+                st.warning("No numeric columns in the current data.")
+            else:
+                num = st.selectbox("Numeric", num_cols)
+                bins = st.slider("Bins", 5, 100, 30)
+                hist = alt.Chart(filtered_df).mark_bar().encode(
+                    x=alt.X(num, bin=alt.Bin(maxbins=bins)),
+                    y='count()',
+                    tooltip=['count()']
+                ).properties(title=f"Histogram of {num}").interactive()
+                st.altair_chart(hist, use_container_width=True)
+
+        elif chart_type == "Scatter":
+            if len(num_cols) < 2:
+                st.warning("Need at least two numeric columns for a scatter plot.")
+            else:
+                x = st.selectbox("X (numeric)", num_cols)
+                y = st.selectbox("Y (numeric)", [c for c in num_cols if c != x] or num_cols)
+                color_opt = ['(none)'] + cat_cols
+                color = st.selectbox("Color by (optional)", color_opt)
+                enc = {'x': x, 'y': y, 'tooltip': [x, y]}
+                if color != '(none)':
+                    enc['color'] = color
+                    enc['tooltip'].append(color)
+                scatter = alt.Chart(filtered_df).mark_circle().encode(**enc)\
+                    .properties(title=f"{x} vs {y}").interactive()
+                st.altair_chart(scatter, use_container_width=True)
+
+        else:  # Heatmap
+            if len(cat_cols) < 2:
+                st.warning("Need at least two categorical columns (≤50 distinct) for a heatmap.")
+            else:
+                r = st.selectbox("Rows (category)", cat_cols)
+                c = st.selectbox("Columns (category)", [k for k in cat_cols if k != r] or cat_cols)
+                pivot = filtered_df.pivot_table(index=r, columns=c, aggfunc='size', fill_value=0)
+                melt = pivot.reset_index().melt(id_vars=r, var_name=c, value_name='count')
+                heat = alt.Chart(melt).mark_rect().encode(
+                    x=alt.X(c, sort='-y'),
+                    y=alt.Y(r, sort='-x'),
+                    color='count',
+                    tooltip=[r, c, 'count']
+                ).properties(title=f"Count heatmap: {r} × {c}")
+                st.altair_chart(heat, use_container_width=True)
 
 with summary_tab:
     st.write("### Summary Statistics (based on filtered data)")
