@@ -6,6 +6,11 @@ import datetime
 from snowflake.connector import connect
 import os
 
+# --------- imports (add these) ----------
+from dataclasses import dataclass
+from typing import Any, List, Tuple
+# ----------------------------------------
+
 # Password protection setup
 def check_password():
     """Returns True if the user entered the correct password."""
@@ -35,151 +40,251 @@ if not check_password():
 st.title("🧬 BiobankTidy") 
 st.caption("BiobankingAI – MVP in collaboration with ASN")
 
-
-# Snowflake connection (using secrets.toml)
-try:
-    conn = connect(
+# ---------- connection (cache) ----------
+@st.cache_resource(show_spinner=False)
+def get_conn():
+    return connect(
         account=st.secrets["connections"]["snowflake"]["account"],
         user=st.secrets["connections"]["snowflake"]["user"],
         password=st.secrets["connections"]["snowflake"]["password"],
         database=st.secrets["connections"]["snowflake"]["database"],
         schema=st.secrets["connections"]["snowflake"]["schema"],
         warehouse=st.secrets["connections"]["snowflake"]["warehouse"],
-        role=st.secrets["connections"]["snowflake"]["role"]
+        role=st.secrets["connections"]["snowflake"]["role"],
     )
-except Exception as e:
-    st.error(f"Failed to connect to Snowflake: {str(e)}")
-    st.stop()
 
-# Load your Snowflake table
-try:
-    cursor = conn.cursor()
-    query = "SELECT * FROM ASN"
-    cursor.execute(query)
-    df_pandas = pd.DataFrame.from_records(iter(cursor), columns=[x[0] for x in cursor.description])
-    cursor.close()
-except Exception as e:
-    st.error(f"Error querying Snowflake: {str(e)}")
-    conn.close()
-    st.stop()
+conn = get_conn()
+DB = st.secrets["connections"]["snowflake"]["database"]
+SCHEMA = st.secrets["connections"]["snowflake"]["schema"]
+TABLE = "ASN"  # adjust if needed
+# ----------------------------------------
 
-# Close the connection
-conn.close()
+# --------- metadata helpers -------------
+def quote_ident(identifier: str) -> str:
+    # for names with spaces / mixed case (e.g., Patient Race)
+    return '"' + identifier.replace('"', '""') + '"'
 
-# Cache the data to improve performance
-@st.cache_data
-def load_data():
-    # Convert date/time columns to datetime if possible
-    date_cols = [col for col in df_pandas.columns if 'Date' in col or 'Time' in col]
-    for col in date_cols:
-        try:
-            df_pandas[col] = pd.to_datetime(df_pandas[col], errors='coerce')
-        except:
-            pass
-    # Ensure GENDER and other categorical columns are strings
-    for col in ['GENDER', 'Patient Race', 'OD_OS']:
-        if col in df_pandas.columns:
-            df_pandas[col] = df_pandas[col].astype(str).replace('nan', None)
-    return df_pandas
+@st.cache_data(show_spinner=False)
+def get_column_meta():
+    sql = """
+    SELECT COLUMN_NAME, DATA_TYPE
+    FROM INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_CATALOG=%s AND TABLE_SCHEMA=%s AND TABLE_NAME=%s
+    ORDER BY ORDINAL_POSITION
+    """
+    cur = conn.cursor()
+    cur.execute(sql, [DB, SCHEMA, TABLE])
+    rows = cur.fetchall()
+    cur.close()
 
-data = load_data()
+    meta = pd.DataFrame(rows, columns=['column','dtype'])
+    def kind(dt):
+        u = str(dt).upper()
+        if any(x in u for x in ['INT','DECIMAL','NUMBER','FLOAT','DOUBLE']):
+            return 'number'
+        if any(x in u for x in ['DATE','TIME','TIMESTAMP']):
+            return 'datetime'
+        return 'text'
+    meta['kind'] = meta['dtype'].map(kind)
+    return meta
 
-# Tabs for Data, Visualization, and Summary
+META = get_column_meta()
+
+@st.cache_data(show_spinner=False)
+def col_minmax(col: str):
+    cur = conn.cursor()
+    cur.execute(f"SELECT MIN({quote_ident(col)}), MAX({quote_ident(col)}) FROM {quote_ident(TABLE)}")
+    lo, hi = cur.fetchone()
+    cur.close()
+    return lo, hi
+
+@st.cache_data(show_spinner=False)
+def col_distinct(col: str, limit: int = 2000):
+    cur = conn.cursor()
+    cur.execute(f"SELECT DISTINCT {quote_ident(col)} FROM {quote_ident(TABLE)} LIMIT {limit}")
+    vals = [r[0] for r in cur.fetchall() if r[0] is not None]
+    cur.close()
+    # convert to str for robust matching in 'IN'
+    return sorted(map(str, vals))
+# ----------------------------------------
+
+# ------------- query builder ------------
+@dataclass
+class Clause:
+    column: str
+    op: str              # '=', '!=', 'contains', 'in', 'between', 'isnull', 'notnull', '>', '>=', '<', '<='
+    value: Any = None    # str | float | (low, high) | list
+    join: str = "AND"    # 'AND' | 'OR' (ignored on first clause)
+
+OP_SQL = {
+    '=': '{col} = %s',
+    '!=': '{col} != %s',
+    '>': '{col} > %s',
+    '>=': '{col} >= %s',
+    '<': '{col} < %s',
+    '<=': '{col} <= %s',
+    'contains': '{col} ILIKE %s',           # %value%
+    'in': '{col} IN ({ph})',                # list
+    'between': '{col} BETWEEN %s AND %s',
+    'isnull': '{col} IS NULL',
+    'notnull': '{col} IS NOT NULL',
+}
+
+def build_where(clauses: List[Clause]) -> Tuple[str, List[Any]]:
+    if not clauses:
+        return "", []
+    parts, params = [], []
+    for i, c in enumerate(clauses):
+        col = quote_ident(c.column)
+        if c.op == 'in':
+            vals = c.value if isinstance(c.value, list) else [c.value]
+            ph = ','.join(['%s']*len(vals))
+            sql = OP_SQL['in'].format(col=col, ph=ph)
+            p = vals
+        elif c.op == 'contains':
+            sql = OP_SQL['contains'].format(col=col)
+            p = [f"%{c.value}%"]
+        elif c.op == 'between':
+            sql = OP_SQL['between'].format(col=col)
+            low, high = c.value
+            p = [low, high]
+        elif c.op in ('isnull','notnull'):
+            sql = OP_SQL[c.op].format(col=col)
+            p = []
+        else:
+            sql = OP_SQL[c.op].format(col=col)
+            p = [c.value]
+
+        if i > 0:
+            parts.append(c.join)
+        parts.append(f"({sql})")
+        params.extend(p)
+
+    return "WHERE " + " ".join(parts), params
+
+def fetch_data(clauses: List[Clause], columns: List[str] | None = None, limit: int = 5000):
+    where, params = build_where(clauses)
+    cols_sql = ", ".join(quote_ident(c) for c in columns) if columns else "*"
+    sql = f"SELECT {cols_sql} FROM {quote_ident(TABLE)} {where} LIMIT %s"
+    cur = conn.cursor()
+    cur.execute(sql, params + [limit])
+    df = pd.DataFrame.from_records(iter(cur), columns=[c[0] for c in cur.description])
+    cur.close()
+    return df
+
+def fetch_count(clauses: List[Clause]):
+    where, params = build_where(clauses)
+    sql = f"SELECT COUNT(*) FROM {quote_ident(TABLE)} {where}"
+    cur = conn.cursor()
+    cur.execute(sql, params)
+    n = cur.fetchone()[0]
+    cur.close()
+    return int(n)
+# ----------------------------------------
+
+# ---------------- data tab --------------
 data_tab, viz_tab, summary_tab = st.tabs(["Data Table", "Visualizations", "Summary Stats"])
 
 with data_tab:
     st.write("### PilotData-WholeGlobe_Banked+Pending")
-    
-    # Global search across all columns
-    search_query = st.text_input("Global Search (case-insensitive, searches all columns)", "")
-    if search_query:
-        mask = data.apply(lambda row: row.astype(str).str.contains(search_query, case=False, na=False).any(), axis=1)
-        filtered_df = data[mask]
-    else:
-        filtered_df = data.copy()
-    
-    # Smart filtering system in sidebar
-    with st.sidebar:
-        st.write("#### Smart Filters")
-        filter_cols = st.multiselect("Select columns to filter", sorted(filtered_df.columns.tolist()))
-        
-        filter_conditions = {}
-        for col in filter_cols:
-            if col not in filtered_df.columns:
-                st.warning(f"Column {col} not found in dataset.")
-                continue
-            if pd.api.types.is_numeric_dtype(filtered_df[col]):
-                min_val = float(filtered_df[col].min()) if not filtered_df[col].isna().all() else 0.0
-                max_val = float(filtered_df[col].max()) if not filtered_df[col].isna().all() else 100.0
-                selected_range = st.slider(
-                    f"{col} (range)",
-                    min_val,
-                    max_val,
-                    (min_val, max_val),
-                    key=f"slider_{col}"
-                )
-                filter_conditions[col] = filtered_df[col].between(selected_range[0], selected_range[1])
-            elif pd.api.types.is_datetime64_any_dtype(filtered_df[col]):
-                min_date = filtered_df[col].min().date() if not pd.isnull(filtered_df[col].min()) else datetime.date.today()
-                max_date = filtered_df[col].max().date() if not pd.isnull(filtered_df[col].max()) else datetime.date.today()
-                selected_dates = st.date_input(
-                    f"{col} (date range)",
-                    (min_date, max_date),
-                    key=f"date_{col}"
-                )
-                if len(selected_dates) == 2:
-                    start, end = selected_dates
-                    filter_conditions[col] = (filtered_df[col] >= pd.to_datetime(start)) & (filtered_df[col] <= pd.to_datetime(end))
-            else:
-                unique_vals = filtered_df[col].dropna().astype(str).unique().tolist()
-                if len(unique_vals) <= 20:  # For categorical/binary (e.g., GENDER, Yes/No)
-                    selected_vals = st.multiselect(f"{col} (select values)", sorted(unique_vals), key=f"multi_{col}")
-                    if selected_vals:
-                        filter_conditions[col] = filtered_df[col].astype(str).isin(selected_vals)
-                else:  # For text columns (e.g., Medical History)
-                    filter_text = st.text_input(f"{col} (contains text)", key=f"text_{col}")
-                    if filter_text:
-                        filter_conditions[col] = filtered_df[col].astype(str).str.contains(filter_text, case=False, na=False)
-    
-    # Apply all filters
-    if filter_conditions:
-        combined_mask = pd.Series(True, index=filtered_df.index)
-        for condition in filter_conditions.values():
-            combined_mask &= condition
-        filtered_df = filtered_df[combined_mask]
-    
-    # Show number of rows after filtering
-    st.write(f"Total rows (after filters): {len(filtered_df)}")
-    
-    # Display data with Streamlit's dataframe, disabling copy-paste and download
-    st.dataframe(
-        filtered_df,
-        use_container_width=True,
-        height=400,
-        hide_index=False
-    )
-    
-    # Custom CSS to prevent text selection/copy and hide download button
-    st.markdown(
-        """
-        <style>
-        .stDataFrame {
-            user-select: none;
-            -webkit-user-select: none;
-            -moz-user-select: none;
-            -ms-user-select: none;
-        }
-    
-        [data-testid="stDownloadButton"],
-        .stDataFrame .st-eb,
-        .stDataFrame [data-testid="stElementToolbar"] {
-            display: none !important;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True
-    )
 
+    # Legacy global search: removed for now (Cortex later)
+
+    # session for UI-built clauses
+    if "clauses" not in st.session_state:
+        st.session_state.clauses: list[Clause] = []
+
+    # ===== Sidebar: Smart Filters =====
+    with st.sidebar:
+        st.subheader("Smart Filters")
+        st.caption("AND/OR chaining • type-aware • Snowflake-backed")
+
+        # add / clear
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("➕ Add filter", use_container_width=True):
+                st.session_state.clauses.append(Clause(column="", op="=", value=None, join="AND"))
+        with c2:
+            if st.button("🧹 Clear all", use_container_width=True):
+                st.session_state.clauses.clear()
+                st.experimental_rerun()
+
+        # render each filter
+        for i, cl in enumerate(st.session_state.clauses):
+            with st.expander(f"Filter {i+1}", expanded=True):
+                # join (except first)
+                if i > 0:
+                    cl.join = st.radio("Join with previous", ["AND","OR"], index=0 if cl.join=="AND" else 1,
+                                       key=f"join_{i}", horizontal=True)
+
+                # searchable column picker
+                q = st.text_input("Find a column", key=f"q_{i}", placeholder="type to search…")
+                subset = META if not q else META[META['column'].str.contains(q, case=False, na=False)]
+                cl.column = st.selectbox("Column", options=subset['column'].tolist(),
+                                         index=(subset['column'].tolist().index(cl.column)
+                                                if cl.column in subset['column'].tolist() else 0) if len(subset)>0 else None,
+                                         key=f"col_{i}")
+
+                if not cl.column:
+                    continue
+
+                kind = META.loc[META['column']==cl.column, 'kind'].iloc[0]
+
+                # operator + value widgets
+                if kind == 'number':
+                    ops = ['between','=', '!=', '>', '>=', '<', '<=', 'isnull', 'notnull']
+                    cl.op = st.selectbox("Operator", ops, index=ops.index(cl.op) if cl.op in ops else 0, key=f"op_n_{i}")
+                    if cl.op == 'between':
+                        lo, hi = col_minmax(cl.column)
+                        lo = float(lo or 0.0); hi = float(hi or 0.0 if lo==0 else hi)
+                        cl.value = st.slider("Range", lo, hi, (lo, hi), key=f"rng_{i}")
+                    elif cl.op not in ('isnull','notnull'):
+                        cl.value = st.number_input("Value", value=float(cl.value or 0.0), key=f"val_n_{i}")
+
+                elif kind == 'datetime':
+                    ops = ['between','=', '>=', '<=', 'isnull', 'notnull']
+                    cl.op = st.selectbox("Operator", ops, index=ops.index(cl.op) if cl.op in ops else 0, key=f"op_d_{i}")
+                    if cl.op == 'between':
+                        lo, hi = col_minmax(cl.column)
+                        lo = pd.to_datetime(lo) if lo is not None else pd.Timestamp("1900-01-01")
+                        hi = pd.to_datetime(hi) if hi is not None else pd.Timestamp.today().normalize()
+                        d1, d2 = st.date_input("Date range", (lo.date(), hi.date()), key=f"dt_{i}")
+                        cl.value = (pd.to_datetime(d1), pd.to_datetime(d2))
+                    elif cl.op not in ('isnull','notnull'):
+                        d = st.date_input("Date", key=f"dt1_{i}")
+                        cl.value = pd.to_datetime(d)
+
+                else:  # text
+                    ops = ['contains','=', '!=', 'in', 'isnull', 'notnull']
+                    cl.op = st.selectbox("Operator", ops, index=ops.index(cl.op) if cl.op in ops else 0, key=f"op_t_{i}")
+                    if cl.op == 'in':
+                        options = col_distinct(cl.column)
+                        sel = st.multiselect("Values", options=options, default=cl.value or [], key=f"in_{i}")
+                        cl.value = sel
+                    elif cl.op not in ('isnull','notnull'):
+                        cl.value = st.text_input("Value", value=str(cl.value or ""), key=f"val_t_{i}")
+
+                # remove button
+                if st.button(f"Remove filter #{i+1}", key=f"rm_{i}"):
+                    st.session_state.clauses.pop(i)
+                    st.experimental_rerun()
+
+    # ===== Fetch & show data =====
+    # (Optional) visible columns picker to keep tables light
+    with st.expander("Visible columns", expanded=False):
+        default_cols = ['SAMPLE_ID','OD_OS','GENDER','Patient Race']
+        existing_defaults = [c for c in default_cols if c in META['column'].tolist()]
+        visible_cols = st.multiselect("Columns to select (optional)", options=META['column'].tolist(),
+                                      default=existing_defaults)
+        if len(visible_cols) == 0:
+            visible_cols = None  # selects all
+
+    filtered_df = fetch_data(st.session_state.clauses, columns=visible_cols, limit=5000)
+    total_rows = fetch_count(st.session_state.clauses)
+
+    st.write(f"Rows matched: **{total_rows}**  |  Showing: **{len(filtered_df)}**")
+    st.dataframe(filtered_df, use_container_width=True, height=420)
+# -------------- end data tab -----------
 
 with viz_tab:
     st.write("### Data Visualizations (based on filtered data)")
