@@ -3,3 +3,5 @@ pandas
 altair
 snowflake-connector-python
 pyvis>=0.3.2
+scikit-learn>=1.4
+umap-learn>=0.5

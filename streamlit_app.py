@@ -11,6 +11,21 @@ from dataclasses import dataclass
 from typing import Any, List, Tuple
 import itertools
 import streamlit.components.v1 as components
+
+# Machine learning imports for clustering
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.cluster import KMeans
+from sklearn.neighbors import NearestNeighbors
+from sklearn.metrics import pairwise_distances
+import numpy as np
+
+# UMAP is optional
+try:
+    import umap
+    HAVE_UMAP = True
+except Exception:
+    HAVE_UMAP = False
 # ----------------------------------------
 
 # Password protection setup
@@ -207,7 +222,7 @@ def fetch_count(clauses: List[Clause]):
 # ----------------------------------------
 
 # ---------------- data tab --------------
-data_tab, viz_tab, summary_tab, co_tab = st.tabs(["Data Table", "Visualizations", "Summary Stats", "Co-occurrence Network"])
+data_tab, viz_tab, summary_tab, co_tab, clusters_tab = st.tabs(["Data Table", "Visualizations", "Summary Stats", "Co-occurrence Network", "Clusters"])
 
 with data_tab:
     st.write("### PilotData-WholeGlobe_Banked+Pending")
@@ -692,3 +707,246 @@ with co_tab:
     except Exception as e:
         st.error(f"Error in co-occurrence analysis: {str(e)}")
         st.info("Please try adjusting your filters or contact support if the issue persists.")
+
+# ============ CLUSTERS TAB ============
+with clusters_tab:
+    st.subheader("Dimensionality, Clusters & Similarity")
+
+    with st.expander("What is this?"):
+        st.markdown(
+            """
+- **Goal:** place each sample in a 2-D map so you can *see cohorts*, *spot outliers*, and *recommend similar or diverse samples*.
+- **How it works:** we convert Hx_/Sx_/Med_ flags to 0/1 and combine them with numeric features (e.g., Age).  
+  We standardize the matrix and project it with **PCA** (linear, interpretable) or **UMAP** (non-linear, better separation).  
+  We then overlay **K-Means** clusters.
+- **Use cases:**  
+  • **Similar picks** – "This sold sample lives in Cluster 3; recommend 5 nearest neighbors."  
+  • **Diversity picks** – "Give me two *very different* samples (far apart)."  
+  • **Explainability** – PCA lists **top contributing features** (flags/meds) driving axes.  
+            """
+        )
+
+    total_rows = fetch_count(st.session_state.clauses)
+
+    # --- choose features ---
+    flag_cols_all = [c for c in META['column'].tolist() if c.startswith(("Hx_","Sx_","Med_"))]
+    num_cols_all  = META.loc[META['kind']=='number','column'].tolist()
+
+    row_cap = st.slider(
+        "Max rows to pull",
+        min_value=300,
+        max_value=int(min(2000, max(300, total_rows))),  # cap to 2k as requested
+        value=int(min(1000, total_rows)),
+        step=100,
+        help="Rows sampled (server-side) from the current filters for analysis. Larger = more stable, slower."
+    )
+
+    topN_flags = st.slider(
+        "Top N flags by prevalence",
+        min_value=20,
+        max_value=int(min(300, len(flag_cols_all) or 20)),
+        value=100,
+        help="Use the most common flags to reduce sparsity/noise (30–150 is a good range)."
+    )
+
+    default_nums = [c for c in ["Age","Death To Preservation","Amount"] if c in num_cols_all]
+    picked_nums = st.multiselect(
+        "Numeric features (optional)",
+        options=sorted(num_cols_all),
+        default=default_nums,
+        help="Add numeric columns to the feature matrix (scaled automatically)."
+    )
+
+    color_by = st.selectbox(
+        "Color points by (category)",
+        ["(none)","GENDER","OD_OS","Patient Race","Research Project"] + flag_cols_all,
+        help="Purely visual grouping; doesn't affect clustering."
+    )
+
+    algo = st.selectbox(
+        "Projection algorithm",
+        ["PCA","UMAP (non-linear)"] if HAVE_UMAP else ["PCA"],
+        help="Start with PCA to understand variance and drivers; switch to UMAP for tighter cohort separation."
+    )
+
+    k_clusters = st.slider(
+        "K-Means: number of clusters (k)",
+        2, 15, 5, help="Overlay k clusters on the 2-D map."
+    )
+
+    n_neighbors = st.slider(
+        "Neighbors to recommend (similar samples)",
+        1, 25, 8, help="Number of nearest neighbors to return for a selected sample."
+    )
+
+    # --- SQL helpers for building feature matrix ---
+    def flag_expr(col):  # Yes/True/1 -> 1 else 0
+        return f"CASE WHEN LOWER(TRIM({quote_ident(col)})) IN ('1','yes','true','y','t') THEN 1 ELSE 0 END AS {quote_ident(col)}"
+
+    def num_expr(col):
+        return f"{quote_ident(col)} AS {quote_ident(col)}"
+
+    # prevalence to pick top-N flags (fast SQL AVG of 0/1)
+    where, params = build_where(st.session_state.clauses)
+    if flag_cols_all:
+        col_list = ", ".join(
+            [f"AVG(CASE WHEN LOWER(TRIM({quote_ident(c)})) IN ('1','yes','true','y','t') THEN 1 ELSE 0 END) AS {quote_ident(c)}"
+             for c in flag_cols_all]
+        )
+        sql_prev = f"SELECT {col_list} FROM {quote_ident(TABLE)} {where}"
+        cur = conn.cursor(); cur.execute(sql_prev, params); prev_row = cur.fetchone(); cur.close()
+        prev = pd.Series(prev_row, index=flag_cols_all).sort_values(ascending=False)
+        top_flags = prev.head(topN_flags).index.tolist()
+    else:
+        prev = pd.Series(dtype=float)
+        top_flags = []
+
+    # Build SELECT for the working dataset
+    select_bits = []
+    # A stable ID helps drill-down later
+    sid_col = "SAMPLE_ID" if "SAMPLE_ID" in META['column'].tolist() else META['column'].tolist()[0]
+    select_bits.append(f"{quote_ident(sid_col)} AS SID")
+    for c in top_flags:
+        select_bits.append(flag_expr(c))
+    for c in picked_nums:
+        select_bits.append(num_expr(c))
+    if color_by and color_by != "(none)":
+        select_bits.append(f"{quote_ident(color_by)} AS COLOR")
+
+    if len(select_bits) <= 1:
+        st.info("Pick at least one feature (flags and/or numeric).")
+        st.stop()
+
+    sql_data = f"""
+        SELECT {", ".join(select_bits)}
+        FROM {quote_ident(TABLE)} {where}
+        LIMIT {int(row_cap)}
+    """
+    cur = conn.cursor(); cur.execute(sql_data, params)
+    cols = [c[0] for c in cur.description]
+    DF = pd.DataFrame.from_records(iter(cur), columns=cols); cur.close()
+
+    if DF.empty:
+        st.warning("No rows returned for the current filters.")
+        st.stop()
+
+    # --- Build X matrix ---
+    feat_cols = top_flags + picked_nums
+    X = DF[feat_cols].copy()
+    # Coerce to numeric (flags are already 0/1 from SQL)
+    for c in X.columns:
+        X[c] = pd.to_numeric(X[c], errors='coerce').fillna(0.0)
+
+    scaler = StandardScaler()
+    Xs = scaler.fit_transform(X.values)
+
+    # --- Projection ---
+    if algo.startswith("PCA"):
+        pca = PCA(n_components=min(10, Xs.shape[1]), random_state=42)
+        Z = pca.fit_transform(Xs)
+        expl = pca.explained_variance_ratio_
+
+        with st.expander("PCA • explained variance & loadings", expanded=False):
+            scree = pd.DataFrame({"PC": [f"PC{i+1}" for i in range(len(expl))], "Variance": expl})
+            sc = alt.Chart(scree).mark_bar().encode(
+                x='PC', y=alt.Y('Variance:Q', axis=alt.Axis(format='%')),
+                tooltip=[alt.Tooltip('Variance:Q', format='.1%'), 'PC']
+            ).properties(title="Scree plot")
+            st.altair_chart(sc, use_container_width=True)
+
+            loadings = pd.DataFrame(pca.components_[:2, :], columns=feat_cols, index=['PC1','PC2']).T
+            top_load = (loadings.abs().sum(axis=1).sort_values(ascending=False)).head(20).index.tolist()
+            st.write("Top contributing features to PC1/PC2")
+            st.dataframe(loadings.loc[top_load])
+        coords = pd.DataFrame({"X": Z[:,0], "Y": Z[:,1], "SID": DF["SID"]})
+
+    else:  # UMAP
+        reducer = umap.UMAP(n_neighbors=15, min_dist=0.1, metric='euclidean', random_state=42)
+        Z2 = reducer.fit_transform(Xs)
+        coords = pd.DataFrame({"X": Z2[:,0], "Y": Z2[:,1], "SID": DF["SID"]})
+        st.caption("UMAP axes are unitless; use them for pattern discovery rather than interpretation.")
+
+    # Coloring / tooltip
+    if "COLOR" in DF.columns:
+        coords["COLOR"] = DF["COLOR"]
+        color_field = "COLOR"
+    else:
+        color_field = None
+
+    # --- KMeans overlay ---
+    km = KMeans(n_clusters=k_clusters, n_init="auto", random_state=42)
+    coords["Cluster"] = km.fit_predict(coords[["X","Y"]])
+
+    # Plot
+    enc = {
+        "x": alt.X("X:Q", title="Component 1"),
+        "y": alt.Y("Y:Q", title="Component 2"),
+        "shape": alt.Shape("Cluster:N"),
+        "tooltip": ["SID","Cluster"]
+    }
+    if color_field:
+        enc["color"] = alt.Color(f"{color_field}:N", legend=alt.Legend(title=color_field))
+        enc["tooltip"].append(color_field)
+
+    chart = alt.Chart(coords).mark_circle(size=70, opacity=0.75).encode(**enc)\
+        .properties(title=f"{algo}: 2-D projection with K-Means overlay").interactive()
+    st.altair_chart(chart, use_container_width=True)
+
+    # --- Cluster sizes ---
+    ccounts = coords["Cluster"].value_counts().rename_axis("Cluster").reset_index(name="Count").sort_values("Cluster")
+    st.write("Cluster sizes")
+    st.dataframe(ccounts, use_container_width=True)
+
+    # --- Similar samples (Nearest Neighbors) ---
+    st.markdown("### Recommend similar samples")
+    sid_options = coords["SID"].astype(str).tolist()
+    sid_pick = st.selectbox(
+        "Pick a sample (SID) to find nearest neighbors",
+        sid_options,
+        help="Returns nearest neighbors in the 2-D space (PCA/UMAP)."
+    )
+    nbrs = NearestNeighbors(n_neighbors=min(n_neighbors+1, len(coords)), metric='euclidean')
+    nbrs.fit(coords[["X","Y"]].values)
+    idx = coords.index[coords["SID"].astype(str) == sid_pick][0]
+    dists, inds = nbrs.kneighbors(coords.loc[[idx], ["X","Y"]].values)
+    inds = inds[0].tolist()
+    dists = dists[0].tolist()
+    # drop self
+    if idx in inds:
+        j = inds.index(idx)
+        inds.pop(j); dists.pop(j)
+    rec = coords.iloc[inds].copy()
+    rec["distance"] = dists
+    rec = rec[["SID","Cluster"] + ([color_field] if color_field else []) + ["distance","X","Y"]]
+    st.dataframe(rec, use_container_width=True)
+    st.download_button("Download neighbors (CSV)", rec.to_csv(index=False).encode("utf-8"), file_name=f"neighbors_{sid_pick}.csv")
+
+    # --- Diversity pick: find a very different pair ---
+    st.markdown("### Find a very different pair (diverse pick)")
+    st.caption("We look among the most extreme points along the axes and return a far pair (approximate, fast).")
+    extreme_k = st.slider("Extreme pool size", 20, min(200, len(coords)), 80,
+                          help="We take this many extreme points (by |X|+|Y|) and search the farthest pair inside.")
+    coords["_ext"] = (coords["X"].abs() + coords["Y"].abs())
+    pool = coords.nlargest(extreme_k, "_ext")[["SID","X","Y","Cluster"] + ([color_field] if color_field else [])].reset_index(drop=True)
+    if len(pool) >= 2:
+        M = pool[["X","Y"]].values
+        D = pairwise_distances(M, metric="euclidean")
+        i, j = np.unravel_index(np.argmax(D), D.shape)
+        far = pool.iloc[[i,j]].copy()
+        far["pair_distance"] = D[i, j]
+        st.dataframe(far)
+        st.download_button("Download pair (CSV)", far.to_csv(index=False).encode("utf-8"), file_name="diverse_pair.csv")
+
+    # --- Enrichment: what characterizes each cluster? (quick lift over overall) ---
+    st.markdown("### Cluster enrichment (top flags per cluster)")
+    # We have flags in X; map rows back to clusters
+    W = pd.DataFrame(X, columns=feat_cols)  # numeric matrix (flags are 0/1)
+    W["Cluster"] = coords["Cluster"].values
+    overall = W[top_flags].mean().replace(0, np.nan)  # avoid div/0
+    show_k = st.slider("Top features to display per cluster", 3, 15, 8)
+    for cl in sorted(coords["Cluster"].unique()):
+        sub = W[W["Cluster"] == cl]
+        prev_cl = sub[top_flags].mean()
+        lift = (prev_cl / overall).sort_values(ascending=False).head(show_k)
+        st.write(f"**Cluster {cl}** — top features (lift over overall prevalence)")
+        st.dataframe(pd.DataFrame({"prevalence": prev_cl[lift.index].round(3), "lift": lift.round(2)}))
