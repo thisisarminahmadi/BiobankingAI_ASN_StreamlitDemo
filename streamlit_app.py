@@ -666,34 +666,33 @@ def apply_simple_filters(df: pd.DataFrame, conditions: List[Dict]) -> pd.DataFra
 st.write(f"**Total rows (after filters): {len(filtered_df)}**")
 
 # Display data with Streamlit's dataframe, disabling copy-paste and download
-    st.dataframe(
-        filtered_df,
-        use_container_width=True,
-        height=400,
-        hide_index=False
-    )
-    
-    # Custom CSS to prevent text selection/copy and hide download button
-    st.markdown(
-        """
-        <style>
-        .stDataFrame {
-            user-select: none;
-            -webkit-user-select: none;
-            -moz-user-select: none;
-            -ms-user-select: none;
-        }
-    
-        [data-testid="stDownloadButton"],
-        .stDataFrame .st-eb,
-        .stDataFrame [data-testid="stElementToolbar"] {
-            display: none !important;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True
-    )
+st.dataframe(
+    filtered_df,
+    use_container_width=True,
+    height=400,
+    hide_index=False
+)
 
+# Custom CSS to prevent text selection/copy and hide download button
+st.markdown(
+    """
+    <style>
+    .stDataFrame {
+        user-select: none;
+        -webkit-user-select: none;
+        -moz-user-select: none;
+        -ms-user-select: none;
+    }
+
+    [data-testid="stDownloadButton"],
+    .stDataFrame .st-eb,
+    .stDataFrame [data-testid="stElementToolbar"] {
+        display: none !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
 
 with viz_tab:
     st.write("### Data Visualizations (based on filtered data)")
