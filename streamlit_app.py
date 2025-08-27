@@ -398,6 +398,43 @@ def category_counts(col: str, top_n: int | None):
     cur.close()
     return pd.DataFrame(rows, columns=['value','count'])
 
+# Helpers to fetch numeric data with safe casts
+def numeric_kind(col: str) -> str:
+    # 'number' or 'text' from META
+    return META.loc[META['column']==col, 'kind'].iloc[0]
+
+def numeric_expr(col: str) -> str:
+    # If stored as text, try to parse as double
+    return f"TRY_TO_DOUBLE({quote_ident(col)})" if numeric_kind(col) == 'text' else quote_ident(col)
+
+def fetch_numeric_series(col: str, cap: int = 50000):
+    where, params = build_where(st.session_state.clauses)
+    expr = numeric_expr(col)
+    sql = f"""
+        SELECT {expr} AS v
+        FROM {quote_ident(TABLE)} {where}
+        WHERE {expr} IS NOT NULL
+        LIMIT {int(cap)}
+    """
+    cur = conn.cursor(); cur.execute(sql, params)
+    df = pd.DataFrame(cur.fetchall(), columns=['v']); cur.close()
+    return df
+
+def fetch_numeric_xy(x_col: str, y_col: str, color_col: str | None, cap: int):
+    where, params = build_where(st.session_state.clauses)
+    x_expr, y_expr = numeric_expr(x_col), numeric_expr(y_col)
+    color_sel = f", {quote_ident(color_col)} AS color" if color_col else ""
+    sql = f"""
+        SELECT {x_expr} AS x, {y_expr} AS y{color_sel}
+        FROM {quote_ident(TABLE)} {where}
+        WHERE {x_expr} IS NOT NULL AND {y_expr} IS NOT NULL
+        LIMIT {int(cap)}
+    """
+    cur = conn.cursor(); cur.execute(sql, params)
+    cols = ['x','y'] + (['color'] if color_col else [])
+    df = pd.DataFrame(cur.fetchall(), columns=cols); cur.close()
+    return df
+
 # ---------- Visualizations ----------
 
 with viz_tab:
@@ -432,62 +469,91 @@ with viz_tab:
                 st.altair_chart(bar, use_container_width=True)
 
     elif chart_type == "Histogram (numeric)":
-        nums = numeric_candidates_nonbinary()
-        if not nums:
+        # Build numeric candidates
+        strict_nums = META.loc[META['kind']=='number','column'].tolist()
+
+        include_text_as_number = st.checkbox(
+            "Include numeric-like text columns (auto-cast with TRY_TO_DOUBLE)",
+            value=False,
+            help="Enable to see text columns that contain mostly numbers (e.g., IDs)."
+        )
+
+        if include_text_as_number:
+            # Offer a search box to keep the dropdown manageable
+            qn = st.text_input("Filter numeric column list", placeholder="type to filter column names…")
+            text_cols = META.loc[META['kind']=='text','column'].tolist()
+            if qn:
+                text_cols = [c for c in text_cols if qn.lower() in c.lower()]
+            numeric_list = sorted(set(strict_nums + text_cols))
+        else:
+            numeric_list = sorted(strict_nums)
+
+        if not numeric_list:
             st.info("No numeric (non-binary) columns found.")
         else:
-            num = st.selectbox("Numeric column", nums, index=nums.index('Age') if 'Age' in nums else 0)
+            num = st.selectbox("Numeric column", numeric_list, index=numeric_list.index('Age') if 'Age' in numeric_list else 0)
             bins = st.slider("Bins", 5, 100, 30)
             # Fetch only this column (big row cap but limited to one column)
-            dfh = fetch_cols_for_viz([num])
-            if dfh.empty or dfh[num].dropna().empty:
+            dfh = fetch_numeric_series(num)  # <-- server-side cast if needed
+            if dfh.empty or dfh['v'].dropna().empty:
                 st.warning("No numeric data to plot.")
             else:
                 hist = alt.Chart(dfh).mark_bar().encode(
-                    x=alt.X(num, bin=alt.Bin(maxbins=bins)),
+                    x=alt.X('v:Q', bin=alt.Bin(maxbins=bins), title=num),
                     y='count()',
                     tooltip=['count()']
                 ).properties(title=f"Histogram of {num}").interactive()
                 st.altair_chart(hist, use_container_width=True)
 
     elif chart_type == "Scatter (numeric × numeric)":
-        nums = numeric_candidates_nonbinary()
-        if len(nums) < 2:
-            st.info("Pick filters that include at least two non-binary numeric columns.")
+        # Build numeric candidates
+        strict_nums = META.loc[META['kind']=='number','column'].tolist()
+
+        include_text_as_number = st.checkbox(
+            "Include numeric-like text columns (auto-cast with TRY_TO_DOUBLE)",
+            value=False,
+            help="Enable to see text columns that contain mostly numbers (e.g., IDs)."
+        )
+
+        if include_text_as_number:
+            # Offer a search box to keep the dropdown manageable
+            qn = st.text_input("Filter numeric column list", placeholder="type to filter column names…")
+            text_cols = META.loc[META['kind']=='text','column'].tolist()
+            if qn:
+                text_cols = [c for c in text_cols if qn.lower() in c.lower()]
+            numeric_list = sorted(set(strict_nums + text_cols))
+        else:
+            numeric_list = sorted(strict_nums)
+
+        if len(numeric_list) < 2:
+            st.info("Pick filters that include at least two numeric columns (or enable numeric-like text).")
         else:
             c1, c2 = st.columns(2)
             with c1:
-                x = st.selectbox("X", nums, index=nums.index('Age') if 'Age' in nums else 0)
+                x = st.selectbox("X", numeric_list, index=numeric_list.index('Age') if 'Age' in numeric_list else 0)
             with c2:
-                y = st.selectbox("Y", [n for n in nums if n != x] or nums)
+                y = st.selectbox("Y", [n for n in numeric_list if n != x] or numeric_list)
 
             color_by = st.selectbox("Color by (optional category)", ["(none)"] + categorical_candidates())
-            sample_cap = st.slider("Max points", 1000, 50000, 10000, help="Data pulled server-side; higher = denser plot")
+            cap = st.slider("Max points", 1000, 50000, 10000)
 
-            df2 = fetch_cols_for_viz([x, y] + ([] if color_by == "(none)" else [color_by]), row_cap=sample_cap)
-            df2 = df2.dropna(subset=[x,y])
+            df2 = fetch_numeric_xy(x, y, None if color_by=="(none)" else color_by, cap)
             if df2.empty:
                 st.warning("No data to plot for these axes.")
             else:
-                enc = {'x': x, 'y': y, 'tooltip': [x, y]}
+                enc = {'x': alt.X('x:Q', title=x), 'y': alt.Y('y:Q', title=y), 'tooltip': ['x','y']}
                 if color_by != "(none)":
-                    enc['color'] = color_by
-                    enc['tooltip'].append(color_by)
-
-                scatter = alt.Chart(df2).mark_circle(opacity=0.7).encode(**enc)\
-                    .properties(title=f"{x} vs {y}").interactive()
-
-                # Trendline + correlation
+                    enc['color'] = alt.Color('color:N', title=color_by)
+                    enc['tooltip'].append('color')
+                scatter = alt.Chart(df2).mark_circle(opacity=0.7).encode(**enc).properties(title=f"{x} vs {y}").interactive()
                 try:
-                    trend = alt.Chart(df2).transform_regression(x, y).mark_line()
+                    trend = alt.Chart(df2).transform_regression('x','y').mark_line()
                     st.altair_chart(scatter + trend, use_container_width=True)
                 except Exception:
                     st.altair_chart(scatter, use_container_width=True)
-
-                # Pearson r
                 try:
-                    r = df2[[x,y]].corr(numeric_only=True).iloc[0,1]
-                    st.caption(f"Pearson r = **{r:.3f}** (based on sampled rows)")
+                    r = df2[['x','y']].corr(numeric_only=True).iloc[0,1]
+                    st.caption(f"Pearson r = **{r:.3f}**")
                 except Exception:
                     pass
 
@@ -551,8 +617,18 @@ with co_tab:
         if not flag_cols:
             st.info("No Hx_/Sx_/Med_ columns found.")
         else:
-            # fetch a sample of flags (wide but capped rows)
-            row_cap = st.slider("Max rows to analyze", 500, 20000, 5000, step=500)
+            # Right-size the "Max rows" slider + add one-line help
+            total_rows = fetch_count(st.session_state.clauses)
+            row_cap_max = min(total_rows, 2000)  # <= 2k as you asked
+            row_cap = st.slider(
+                "Max rows to analyze",
+                min_value=200,
+                max_value=int(row_cap_max) if row_cap_max >= 200 else int(total_rows),
+                value=min(1000, int(row_cap_max)),
+                step=100,
+                help="Upper limit of filtered rows used to compute co-occurrence. Smaller = faster; larger = more stable."
+            )
+            
             df_flags = fetch_cols_for_viz(flag_cols, row_cap=row_cap)
 
             if df_flags.empty:
@@ -568,7 +644,11 @@ with co_tab:
 
             # prevalence and pick top-N for readability
             prev = B.mean(numeric_only=True).sort_values(ascending=False)
-            topN = st.slider("Top N flags by prevalence", 10, min(200, len(prev)), 50)
+            topN = st.slider(
+                "Top N flags by prevalence",
+                10, min(200, len(prev)), 50,
+                help="Show only the N most common flags (nodes). Use 30–60 for a readable graph."
+            )
             top_flags = prev.head(topN).index.tolist()
             B = B[top_flags]
 
@@ -585,7 +665,11 @@ with co_tab:
             if not edges:
                 st.info("No meaningful co-occurrences in the current selection.")
             else:
-                min_j = st.slider("Min Jaccard to show", 0.0, 1.0, 0.1, 0.01)
+                min_j = st.slider(
+                    "Min Jaccard to show",
+                    0.0, 1.0, 0.10, 0.01,
+                    help="Hide weak edges. Jaccard = (rows with A & B) / (rows with A or B). 0.10–0.15 is a good start."
+                )
                 edges = [e for e in edges if e[2] >= min_j]
 
                 if not edges:
@@ -604,7 +688,7 @@ with co_tab:
                     # render
                     html = net.generate_html()
                     components.html(html, height=680, scrolling=True)
-                    st.caption("Node size = prevalence; edge width = co-occurrence strength (Jaccard).")
+                    st.caption("Node size = prevalence in filtered rows. Edge width = Jaccard similarity. Hover for values.")
     except Exception as e:
         st.error(f"Error in co-occurrence analysis: {str(e)}")
         st.info("Please try adjusting your filters or contact support if the issue persists.")
