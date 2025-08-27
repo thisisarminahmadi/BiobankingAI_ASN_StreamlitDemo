@@ -9,6 +9,9 @@ import os
 # --------- imports (add these) ----------
 from dataclasses import dataclass
 from typing import Any, List, Tuple
+import itertools
+from pyvis.network import Network
+import streamlit.components.v1 as components
 # ----------------------------------------
 
 # Password protection setup
@@ -205,7 +208,7 @@ def fetch_count(clauses: List[Clause]):
 # ----------------------------------------
 
 # ---------------- data tab --------------
-data_tab, viz_tab, summary_tab = st.tabs(["Data Table", "Visualizations", "Summary Stats"])
+data_tab, viz_tab, summary_tab, co_tab = st.tabs(["Data Table", "Visualizations", "Summary Stats", "Co-occurrence Network"])
 
 with data_tab:
     st.write("### PilotData-WholeGlobe_Banked+Pending")
@@ -336,82 +339,184 @@ with data_tab:
     st.dataframe(filtered_df, use_container_width=True, height=420)
 # -------------- end data tab -----------
 
+# ---------- Viz helpers ----------
+
+def is_binary_text_values(vals: list[str]) -> bool:
+    lower = {str(v).strip().lower() for v in vals}
+    lower = {v for v in lower if v not in ("", "nan", "none", "null")}
+    return lower.issubset({"0","1","yes","no","true","false"}) and 1 <= len(lower) <= 4
+
+@st.cache_data(show_spinner=False)
+def is_binary_numeric(col: str) -> bool:
+    lo, hi = col_minmax(col)
+    # treat as binary if min/max are 0/1 (allow None for all-null)
+    return (lo in (0, 0.0) and hi in (1, 1.0))
+
+def numeric_candidates_nonbinary():
+    nums = META.loc[META['kind']=='number','column'].tolist()
+    safe = []
+    for c in nums:
+        try:
+            if not is_binary_numeric(c):
+                safe.append(c)
+        except Exception:
+            # if profiling fails, keep it tentatively
+            safe.append(c)
+    return sorted(list(dict.fromkeys(safe)))
+
+def categorical_candidates():
+    # Start with known flags and standard categoricals
+    cats = []
+    for c, k in META[['column','kind']].values:
+        if c.startswith(("Hx_","Sx_","Med_")):
+            cats.append(c)
+        elif k == 'datetime':
+            continue
+        elif k == 'number':
+            try:
+                if is_binary_numeric(c):
+                    cats.append(c)
+            except Exception:
+                pass
+        else:
+            cats.append(c)
+    return sorted(list(dict.fromkeys(cats)))
+
+def fetch_cols_for_viz(cols: list[str], row_cap: int = 50000):
+    # Reuse current filters but only pull the viz columns
+    return fetch_data(st.session_state.clauses, columns=cols, limit=row_cap)
+
+# Server-side category counts (accurate & fast)
+def category_counts(col: str, top_n: int | None):
+    where, params = build_where(st.session_state.clauses)
+    colq = quote_ident(col)
+    sql = f"SELECT {colq} AS v, COUNT(*) AS n FROM {quote_ident(TABLE)} {where} GROUP BY 1 ORDER BY n DESC"
+    if top_n:
+        sql += f" LIMIT {int(top_n)}"
+    cur = conn.cursor()
+    cur.execute(sql, params)
+    rows = cur.fetchall()
+    cur.close()
+    return pd.DataFrame(rows, columns=['value','count'])
+
+# ---------- Visualizations ----------
+
 with viz_tab:
-    st.subheader("Explore (based on current filters)")
+    st.subheader("Visualizations")
 
-    if filtered_df.empty:
-        st.info("No data to visualize. Adjust filters.")
-    else:
-        cols = filtered_df.columns.tolist()
-        num_cols = [c for c in cols if pd.api.types.is_numeric_dtype(filtered_df[c])]
-        cat_cols = [c for c in cols if filtered_df[c].nunique(dropna=True) <= 50]
+    # Choose chart family
+    chart_type = st.radio(
+        "Pick a chart",
+        ["Bar (count by category)", "Histogram (numeric)", "Scatter (numeric × numeric)", "Heatmap (category × category)"],
+        horizontal=False
+    )
 
-        chart_type = st.selectbox(
-            "Chart type",
-            ["Bar (count by category)", "Histogram", "Scatter", "Heatmap (count)"]
-        )
+    if chart_type == "Bar (count by category)":
+        cats = categorical_candidates()
+        if not cats:
+            st.info("No categorical columns available.")
+        else:
+            cat = st.selectbox("Category column", cats, index=0)
+            use_top = st.checkbox("Show top N categories only (for long tails)", value=True)
+            topn = st.slider("Top N", 5, 100, 20) if use_top else None
 
-        if chart_type == "Bar (count by category)":
-            if not cat_cols:
-                st.warning("No categorical columns (≤50 distinct) in the current data.")
+            counts = category_counts(cat, topn)
+            if counts.empty:
+                st.warning("No data for this category and current filters.")
             else:
-                cat = st.selectbox("Category", cat_cols)
-                topk = st.slider("Top K", 5, 100, 20)
-                vc = (filtered_df[cat].astype(str)
-                      .value_counts(dropna=True)
-                      .head(topk)
-                      .reset_index())
-                vc.columns = [cat, 'count']
-                bar = alt.Chart(vc).mark_bar().encode(
-                    x=alt.X(cat, sort='-y'),
-                    y='count',
-                    tooltip=[cat, 'count']
-                ).properties(title=f"Count of {cat} (Top {topk})").interactive()
+                st.caption("Counts computed on the full filtered set" + (f", showing top {topn}." if topn else "."))
+                bar = alt.Chart(counts).mark_bar().encode(
+                    x=alt.X('value:N', sort='-y', title=cat),
+                    y=alt.Y('count:Q', title='Count'),
+                    tooltip=['value', 'count']
+                ).properties(title=f"Count of {cat}").interactive()
                 st.altair_chart(bar, use_container_width=True)
 
-        elif chart_type == "Histogram":
-            if not num_cols:
-                st.warning("No numeric columns in the current data.")
+    elif chart_type == "Histogram (numeric)":
+        nums = numeric_candidates_nonbinary()
+        if not nums:
+            st.info("No numeric (non-binary) columns found.")
+        else:
+            num = st.selectbox("Numeric column", nums, index=nums.index('Age') if 'Age' in nums else 0)
+            bins = st.slider("Bins", 5, 100, 30)
+            # Fetch only this column (big row cap but limited to one column)
+            dfh = fetch_cols_for_viz([num])
+            if dfh.empty or dfh[num].dropna().empty:
+                st.warning("No numeric data to plot.")
             else:
-                num = st.selectbox("Numeric", num_cols)
-                bins = st.slider("Bins", 5, 100, 30)
-                hist = alt.Chart(filtered_df).mark_bar().encode(
+                hist = alt.Chart(dfh).mark_bar().encode(
                     x=alt.X(num, bin=alt.Bin(maxbins=bins)),
                     y='count()',
                     tooltip=['count()']
                 ).properties(title=f"Histogram of {num}").interactive()
                 st.altair_chart(hist, use_container_width=True)
 
-        elif chart_type == "Scatter":
-            if len(num_cols) < 2:
-                st.warning("Need at least two numeric columns for a scatter plot.")
-            else:
-                x = st.selectbox("X (numeric)", num_cols)
-                y = st.selectbox("Y (numeric)", [c for c in num_cols if c != x] or num_cols)
-                color_opt = ['(none)'] + cat_cols
-                color = st.selectbox("Color by (optional)", color_opt)
-                enc = {'x': x, 'y': y, 'tooltip': [x, y]}
-                if color != '(none)':
-                    enc['color'] = color
-                    enc['tooltip'].append(color)
-                scatter = alt.Chart(filtered_df).mark_circle().encode(**enc)\
-                    .properties(title=f"{x} vs {y}").interactive()
-                st.altair_chart(scatter, use_container_width=True)
+    elif chart_type == "Scatter (numeric × numeric)":
+        nums = numeric_candidates_nonbinary()
+        if len(nums) < 2:
+            st.info("Pick filters that include at least two non-binary numeric columns.")
+        else:
+            c1, c2 = st.columns(2)
+            with c1:
+                x = st.selectbox("X", nums, index=nums.index('Age') if 'Age' in nums else 0)
+            with c2:
+                y = st.selectbox("Y", [n for n in nums if n != x] or nums)
 
-        else:  # Heatmap
-            if len(cat_cols) < 2:
-                st.warning("Need at least two categorical columns (≤50 distinct) for a heatmap.")
+            color_by = st.selectbox("Color by (optional category)", ["(none)"] + categorical_candidates())
+            sample_cap = st.slider("Max points", 1000, 50000, 10000, help="Data pulled server-side; higher = denser plot")
+
+            df2 = fetch_cols_for_viz([x, y] + ([] if color_by == "(none)" else [color_by]), row_cap=sample_cap)
+            df2 = df2.dropna(subset=[x,y])
+            if df2.empty:
+                st.warning("No data to plot for these axes.")
             else:
-                r = st.selectbox("Rows (category)", cat_cols)
-                c = st.selectbox("Columns (category)", [k for k in cat_cols if k != r] or cat_cols)
-                pivot = filtered_df.pivot_table(index=r, columns=c, aggfunc='size', fill_value=0)
-                melt = pivot.reset_index().melt(id_vars=r, var_name=c, value_name='count')
-                heat = alt.Chart(melt).mark_rect().encode(
-                    x=alt.X(c, sort='-y'),
-                    y=alt.Y(r, sort='-x'),
-                    color='count',
-                    tooltip=[r, c, 'count']
-                ).properties(title=f"Count heatmap: {r} × {c}")
+                enc = {'x': x, 'y': y, 'tooltip': [x, y]}
+                if color_by != "(none)":
+                    enc['color'] = color_by
+                    enc['tooltip'].append(color_by)
+
+                scatter = alt.Chart(df2).mark_circle(opacity=0.7).encode(**enc)\
+                    .properties(title=f"{x} vs {y}").interactive()
+
+                # Trendline + correlation
+                try:
+                    trend = alt.Chart(df2).transform_regression(x, y).mark_line()
+                    st.altair_chart(scatter + trend, use_container_width=True)
+                except Exception:
+                    st.altair_chart(scatter, use_container_width=True)
+
+                # Pearson r
+                try:
+                    r = df2[[x,y]].corr(numeric_only=True).iloc[0,1]
+                    st.caption(f"Pearson r = **{r:.3f}** (based on sampled rows)")
+                except Exception:
+                    pass
+
+    else:  # Heatmap
+        cats = categorical_candidates()
+        if len(cats) < 2:
+            st.info("Need at least two categorical columns for a heatmap.")
+        else:
+            row_cat = st.selectbox("Rows", cats)
+            col_cat = st.selectbox("Columns", [c for c in cats if c != row_cat] or cats)
+            where, params = build_where(st.session_state.clauses)
+            sql = f"""
+                SELECT {quote_ident(row_cat)} AS r, {quote_ident(col_cat)} AS c, COUNT(*) AS n
+                FROM {quote_ident(TABLE)} {where}
+                GROUP BY 1,2
+            """
+            cur = conn.cursor(); cur.execute(sql, params)
+            rows = cur.fetchall(); cur.close()
+            dfh = pd.DataFrame(rows, columns=['r','c','n'])
+            if dfh.empty:
+                st.warning("No data for these categories.")
+            else:
+                heat = alt.Chart(dfh).mark_rect().encode(
+                    x=alt.X('c:N', title=col_cat, sort='-y'),
+                    y=alt.Y('r:N', title=row_cat, sort='-x'),
+                    color=alt.Color('n:Q', title='Count'),
+                    tooltip=[alt.Tooltip('r:N', title=row_cat), alt.Tooltip('c:N', title=col_cat), 'n:Q']
+                ).properties(title=f"Count heatmap: {row_cat} × {col_cat}")
                 st.altair_chart(heat, use_container_width=True)
 
 with summary_tab:
@@ -420,3 +525,59 @@ with summary_tab:
         st.write(filtered_df.describe(include='all'))
     except Exception as e:
         st.warning(f"Error generating summary statistics: {str(e)}")
+
+with co_tab:
+    st.subheader("Disease / Medication Co-occurrence")
+
+    # pick flag columns
+    flag_cols = [c for c in META['column'].tolist() if c.startswith(("Hx_","Sx_","Med_"))]
+    if not flag_cols:
+        st.info("No Hx_/Sx_/Med_ columns found.")
+    else:
+        # fetch a sample of flags (wide but capped rows)
+        row_cap = st.slider("Max rows to analyze", 500, 20000, 5000, step=500)
+        df_flags = fetch_cols_for_viz(flag_cols, row_cap=row_cap)
+
+        # normalize to boolean
+        def to_bool(s: pd.Series) -> pd.Series:
+            s2 = s.astype(str).str.strip().str.lower()
+            return s2.isin(["1","yes","true","y","t"])
+
+        B = pd.DataFrame({c: to_bool(df_flags[c]) for c in df_flags.columns})
+
+        # prevalence and pick top-N for readability
+        prev = B.mean(numeric_only=True).sort_values(ascending=False)
+        topN = st.slider("Top N flags by prevalence", 10, min(200, len(prev)), 50)
+        top_flags = prev.head(topN).index.tolist()
+        B = B[top_flags]
+
+        # co-occurrence via Jaccard
+        counts = B.sum()
+        edges = []
+        for a, b in itertools.combinations(top_flags, 2):
+            inter = (B[a] & B[b]).sum()
+            union = (B[a] | B[b]).sum()
+            j = (inter / union) if union else 0.0
+            if j > 0:
+                edges.append((a, b, j, int(inter)))
+
+        if not edges:
+            st.info("No meaningful co-occurrences in the current selection.")
+        else:
+            min_j = st.slider("Min Jaccard to show", 0.0, 1.0, 0.1, 0.01)
+            edges = [e for e in edges if e[2] >= min_j]
+
+            # build network
+            net = Network(height="650px", width="100%", notebook=True, cdn_resources="in_line", directed=False)
+            # nodes with size by prevalence
+            for n in top_flags:
+                size = 10 + 40 * float(prev[n])  # scale
+                net.add_node(n, label=n, title=f"Prevalence: {prev[n]:.2%}", value=size)
+            # edges with width by jaccard
+            for a,b,j,co in edges:
+                net.add_edge(a, b, value=1 + 10*j, title=f"Co-occurrence: {co} | Jaccard {j:.2f}")
+
+            # render
+            html = net.generate_html()
+            components.html(html, height=680, scrolling=True)
+            st.caption("Node size = prevalence; edge width = co-occurrence strength (Jaccard).")

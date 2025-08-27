@@ -2,3 +2,4 @@ streamlit
 pandas
 altair
 snowflake-connector-python
+pyvis==0.3.2
