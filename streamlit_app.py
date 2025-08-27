@@ -10,7 +10,6 @@ import os
 from dataclasses import dataclass
 from typing import Any, List, Tuple
 import itertools
-from pyvis.network import Network
 import streamlit.components.v1 as components
 # ----------------------------------------
 
@@ -529,55 +528,83 @@ with summary_tab:
 with co_tab:
     st.subheader("Disease / Medication Co-occurrence")
 
-    # pick flag columns
-    flag_cols = [c for c in META['column'].tolist() if c.startswith(("Hx_","Sx_","Med_"))]
-    if not flag_cols:
-        st.info("No Hx_/Sx_/Med_ columns found.")
-    else:
-        # fetch a sample of flags (wide but capped rows)
-        row_cap = st.slider("Max rows to analyze", 500, 20000, 5000, step=500)
-        df_flags = fetch_cols_for_viz(flag_cols, row_cap=row_cap)
+    # Check if pyvis is available
+    try:
+        from pyvis.network import Network
+        pyvis_available = True
+    except ImportError as e:
+        st.error(f"⚠️ Pyvis library not available: {str(e)}")
+        st.info("This feature requires the pyvis library for network visualizations.")
+        st.code("pip install pyvis>=0.3.2")
+        pyvis_available = False
+    except Exception as e:
+        st.error(f"⚠️ Error loading pyvis: {str(e)}")
+        st.info("This feature requires the pyvis library for network visualizations.")
+        pyvis_available = False
 
-        # normalize to boolean
-        def to_bool(s: pd.Series) -> pd.Series:
-            s2 = s.astype(str).str.strip().str.lower()
-            return s2.isin(["1","yes","true","y","t"])
+    if not pyvis_available:
+        st.stop()
 
-        B = pd.DataFrame({c: to_bool(df_flags[c]) for c in df_flags.columns})
-
-        # prevalence and pick top-N for readability
-        prev = B.mean(numeric_only=True).sort_values(ascending=False)
-        topN = st.slider("Top N flags by prevalence", 10, min(200, len(prev)), 50)
-        top_flags = prev.head(topN).index.tolist()
-        B = B[top_flags]
-
-        # co-occurrence via Jaccard
-        counts = B.sum()
-        edges = []
-        for a, b in itertools.combinations(top_flags, 2):
-            inter = (B[a] & B[b]).sum()
-            union = (B[a] | B[b]).sum()
-            j = (inter / union) if union else 0.0
-            if j > 0:
-                edges.append((a, b, j, int(inter)))
-
-        if not edges:
-            st.info("No meaningful co-occurrences in the current selection.")
+    try:
+        # pick flag columns
+        flag_cols = [c for c in META['column'].tolist() if c.startswith(("Hx_","Sx_","Med_"))]
+        if not flag_cols:
+            st.info("No Hx_/Sx_/Med_ columns found.")
         else:
-            min_j = st.slider("Min Jaccard to show", 0.0, 1.0, 0.1, 0.01)
-            edges = [e for e in edges if e[2] >= min_j]
+            # fetch a sample of flags (wide but capped rows)
+            row_cap = st.slider("Max rows to analyze", 500, 20000, 5000, step=500)
+            df_flags = fetch_cols_for_viz(flag_cols, row_cap=row_cap)
 
-            # build network
-            net = Network(height="650px", width="100%", notebook=True, cdn_resources="in_line", directed=False)
-            # nodes with size by prevalence
-            for n in top_flags:
-                size = 10 + 40 * float(prev[n])  # scale
-                net.add_node(n, label=n, title=f"Prevalence: {prev[n]:.2%}", value=size)
-            # edges with width by jaccard
-            for a,b,j,co in edges:
-                net.add_edge(a, b, value=1 + 10*j, title=f"Co-occurrence: {co} | Jaccard {j:.2f}")
+            if df_flags.empty:
+                st.warning("No data available for analysis with current filters.")
+                st.stop()
 
-            # render
-            html = net.generate_html()
-            components.html(html, height=680, scrolling=True)
-            st.caption("Node size = prevalence; edge width = co-occurrence strength (Jaccard).")
+            # normalize to boolean
+            def to_bool(s: pd.Series) -> pd.Series:
+                s2 = s.astype(str).str.strip().str.lower()
+                return s2.isin(["1","yes","true","y","t"])
+
+            B = pd.DataFrame({c: to_bool(df_flags[c]) for c in df_flags.columns})
+
+            # prevalence and pick top-N for readability
+            prev = B.mean(numeric_only=True).sort_values(ascending=False)
+            topN = st.slider("Top N flags by prevalence", 10, min(200, len(prev)), 50)
+            top_flags = prev.head(topN).index.tolist()
+            B = B[top_flags]
+
+            # co-occurrence via Jaccard
+            counts = B.sum()
+            edges = []
+            for a, b in itertools.combinations(top_flags, 2):
+                inter = (B[a] & B[b]).sum()
+                union = (B[a] | B[b]).sum()
+                j = (inter / union) if union else 0.0
+                if j > 0:
+                    edges.append((a, b, j, int(inter)))
+
+            if not edges:
+                st.info("No meaningful co-occurrences in the current selection.")
+            else:
+                min_j = st.slider("Min Jaccard to show", 0.0, 1.0, 0.1, 0.01)
+                edges = [e for e in edges if e[2] >= min_j]
+
+                if not edges:
+                    st.info("No edges meet the minimum Jaccard threshold.")
+                else:
+                    # build network
+                    net = Network(height="650px", width="100%", notebook=True, cdn_resources="in_line", directed=False)
+                    # nodes with size by prevalence
+                    for n in top_flags:
+                        size = 10 + 40 * float(prev[n])  # scale
+                        net.add_node(n, label=n, title=f"Prevalence: {prev[n]:.2%}", value=size)
+                    # edges with width by jaccard
+                    for a,b,j,co in edges:
+                        net.add_edge(a, b, value=1 + 10*j, title=f"Co-occurrence: {co} | Jaccard {j:.2f}")
+
+                    # render
+                    html = net.generate_html()
+                    components.html(html, height=680, scrolling=True)
+                    st.caption("Node size = prevalence; edge width = co-occurrence strength (Jaccard).")
+    except Exception as e:
+        st.error(f"Error in co-occurrence analysis: {str(e)}")
+        st.info("Please try adjusting your filters or contact support if the issue persists.")
