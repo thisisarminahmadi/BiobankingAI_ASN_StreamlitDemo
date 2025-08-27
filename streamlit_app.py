@@ -779,7 +779,7 @@ with data_tab:
                             value = st.number_input("Value", key=f"val_{group_idx}")
                         elif pd.api.types.is_datetime64_any_dtype(col_data):
                             value = st.date_input("Date", key=f"val_{group_idx}")
-            else:
+                        else:
                             value = st.text_input("Value", key=f"val_{group_idx}")
                     
                     # Add condition button
