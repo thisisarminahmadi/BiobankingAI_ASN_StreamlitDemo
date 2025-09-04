@@ -80,7 +80,7 @@ def get_conn():
 conn = get_conn()
 DB = st.secrets["connections"]["snowflake"]["database"]
 SCHEMA = st.secrets["connections"]["snowflake"]["schema"]
-TABLE = "ASN_1"  
+TABLE = "ASN_1".upper()  
 # ----------------------------------------
 
 # --------- metadata helpers -------------
