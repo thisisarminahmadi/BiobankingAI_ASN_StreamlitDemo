@@ -97,7 +97,7 @@ def get_column_meta():
     ORDER BY ORDINAL_POSITION
     """
     cur = conn.cursor()
-    cur.execute(sql, [DB, SCHEMA, TABLE])
+    cur.execute(sql, [DB.upper(), SCHEMA.upper(), TABLE.upper()])
     rows = cur.fetchall()
     cur.close()
 
